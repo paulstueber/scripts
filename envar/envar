@@ -1,0 +1,275 @@
+#!/bin/bash
+
+# tries first to get the current users home dir by trying different default ENVARs
+# inspired by: http://stackoverflow.com/questions/3963716/how-to-manually-expand-a-special-variable-ex-tilde-in-bash/29310477#29310477
+expandPath() {
+  # define local var
+  local result
+  : "$result"
+  case $1 in
+    "~+"/*)
+      result=$PWD/${1#"~+/"}
+      ;;
+    "~-"/*)
+      result=$OLDPWD/${1#"~-/"}
+      ;;
+    "~"/*)
+      result=$HOME/${1#"~/"}
+      ;;
+    "~"*)
+      username=${1%%/*}
+      username=${username#"~"}
+      IFS=: read _ _ _ _ _ homedir _ < <(getent passwd "$username")
+      if [[ $1 = */* ]]; then
+        result=${homedir}/${1#*/}
+      else
+        result=$homedir
+      fi
+      ;;
+    esac
+  printf '%s\n' "${result%:}"
+}
+
+function print_usage() {
+  echo "#############################################################################################"
+  echo "#"
+  echo "#                                       USAGE "
+  echo "#"
+  echo "# Util to manage environment variables. All vars are stored in a .envars file in the "
+  echo "# users home directory (~/.envars). To apply exports done by this script in the current "
+  echo "# shell, source it using '. envar'. Otherwise the exports will be applied to the "
+  echo "# scripts shell."
+  echo "#"
+  echo "# envar action (group=default) [key] [value]"
+  echo "#  - action: (${ACTION_GET} | ${ACTION_ADD} | ${ACTION_SET} | ${ACTION_LIST_GROUPS} | ${ACTION_HELP})"
+  echo "#            - ${ACTION_GET}: get variables for group. If no key is set, all for current group are returned"
+  echo "#            - ${ACTION_ADD}: add new variable. If no key group set, it is added to the default group"
+  echo "#            - ${ACTION_SET}: set/export all vairables of the current group"
+  echo "#            - ${ACTION_LIST_GROUPS}: list all available groups"
+  echo "#            - ${ACTION_HELP}: print this help"
+  echo "#  - group : name set envar var group (default=default)"
+  echo "#  - key   : key of targeted envar (required for action=add)"
+  echo "#  - value : value of targeted envar (only for action=add)"
+  echo "#"
+  echo "# Examples: "
+  echo "#     - start interactive mode    : envar"
+  echo "#     - add var                   : envar ${ACTION_ADD} AWS-INT access_key \"foo...bar\""
+  echo "#     - get all groups            : envar ${ACTION_LIST_GROUPS}"
+  echo "#     - list all vars for a group : envar ${ACTION_GET} AWS-INT"
+  echo "#     - set all vars for a group  : . envar AWS-INT"
+  echo "#     -                       or    . envar ${ACTION_SET} AWS-INT"
+  echo "#"
+  echo "#############################################################################################"
+}
+
+# ensure that every group is only applied once to avoid infinite loops (when using group references)
+ANTI_LOOPING=""
+function get_set_envar() {
+    # check if the current group was alredy applied. Skip if so.
+    LOOPED=$(echo "$ANTI_LOOPING" | grep "$SELECTED_GROUP")
+    if [ -z "$LOOPED" ]; then
+      # add current group name to the looping var
+      ANTI_LOOPING="$ANTI_LOOPING\n $SELECTED_GROUP"
+  
+      # extract all envars for he current group
+      ENVARS=$(grep -A1000 "\[$SELECTED_GROUP\]" "$ENVARS_FILE" | tail -n+2 | grep -m 1 -B1000 "\[.*\]" | sed \$d)
+      if [ -z "$ENVARS" ]; then
+        ENVARS=$(grep -A1000 "\[$SELECTED_GROUP\]" "$ENVARS_FILE" | tail -n+2)
+      fi
+      
+      # iterate over all envars/references of the current group
+      while read line; do
+        # if the current line is a reference to another group, call get_set_envar for that group (recursive)
+        if [[ "$line"  =~ include* ]]; then
+          # store current group in a temp var
+          TMP_GROUP="$SELECTED_GROUP" 
+          # set name of referenced group as current group
+          SELECTED_GROUP=$(echo $line | sed -n -e 's/^.*include //p')
+          # apply all vars of referenced group
+          get_set_envar
+          # reset current group
+          SELECTED_GROUP="$TMP_GROUP"
+        else
+          # if current line is a var, either export the var (set) or only print its export command (get)
+          if [ "$SELECTED_ACTION" == "$ACTION_SET" ] && [ "$line" ] && [[ "$line"  != \#* ]]; then
+            export $line
+            echo "export $line"
+          else
+            if [ "$line" ] && [[ "$line"  != \#* ]]; then
+              echo "$line"
+            fi
+          fi
+        fi 
+      done <<< "$ENVARS"
+    fi
+}
+
+# add an envar to a group
+function add_envar() {
+    ENVARS=$(grep "\[$SELECTED_GROUP\]" "$ENVARS_FILE")
+    if [ -z "$ENVARS" ]; then
+      echo "[$SELECTED_GROUP]" >> $ENVARS_FILE
+    fi
+    sed -i "/\[$SELECTED_GROUP\]/a $SELECTED_KEY=$SELECTED_VALUE" $ENVARS_FILE
+}
+
+# print all available groups with prepending number
+function print_groups() {
+  i=1
+  while read group; do
+    echo " $i) $group"
+    ((i++))
+  done <<< "$ENVARS_GROUPS"
+}
+
+# interactive group select
+function get_group_by_input() {
+  echo "Available groups:"
+  print_groups
+
+  # set default value for group
+  SELECTED_GROUP=$DEFAULT_GROUP
+  printf " enter number or name [${BOLD}$DEFAULT_GROUP${NORMAL}]: "
+  read -r _selected_group
+  i=1
+  while read group; do
+    if [ "$_selected_group" == "$i" ] || [[ "$_selected_group" == "$group" ]]; then
+      SELECTED_GROUP="$group"
+      break
+    fi
+    ((i++))
+  done <<< "$ENVARS_GROUPS"
+}
+
+############################################
+#####          INITIALIZATION
+############################################
+
+# create .envars file if it does not already exist
+ENVARS_FILE=$(expandPath '~/.envars')
+if ! [ -e "$ENVARS_FILE" ]; then
+  touch "$ENVARS_FILE"
+fi
+
+# extract all available groupd from envars file
+ENVARS_GROUPS=$(cat $ENVARS_FILE | grep "\[*\]" | sed 's/^.\(.*\).$/\1/')
+
+# text formating
+BOLD=$(tput bold)
+NORMAL=$(tput sgr0)
+
+# define available actions:
+ACTION_GET="-l"
+ACTION_ADD="-a"
+ACTION_SET="-s"
+ACTION_LIST_GROUPS="-g"
+ACTION_HELP="-h"
+
+# default values (if not set)
+DEFAULT_ACTION="$ACTION_SET"
+DEFAULT_GROUP="default"
+
+
+#############################################
+###                PARAMETERS             ###
+#############################################
+SELECTED_ACTION="$DEFAULT_ACTION"
+SELECTED_GROUP=""
+SELECTED_KEY=""
+SELECTED_VALUE=""
+
+
+#############################################
+###  COMMAND LINE ARGUMENTS & USER INPUT  ###
+#############################################
+# when no parameter was passed, ask user what to do
+if [ "$#" -eq 0 ]; then
+  echo "Available options:"
+  echo " ${BOLD}1${NORMAL}) set group vars (${BOLD}-s${NORMAL})"
+  echo " ${BOLD}2${NORMAL}) list groups (${BOLD}-l${NORMAL})"
+  echo " ${BOLD}3${NORMAL}) get group vars (${BOLD}-g${NORMAL})"
+  echo " ${BOLD}4${NORMAL}) add var to group (${BOLD}-a${NORMAL})"
+  echo " ${BOLD}5${NORMAL}) show help (${BOLD}-h${NORMAL})"
+  printf " select action [${BOLD}$DEFAULT_ACTION${NORMAL}]: "
+  read -r _select
+  
+  if [ "$_select" == "1" ] || [ "$_select" == "$ACTION_SET" ]; then
+    SELECTED_ACTION="$ACTION_SET"
+  fi
+  if [ "$_select" == "2" ] || [ "$_select" == "$ACTION_LIST_GROUPS" ]; then
+    SELECTED_ACTION="$ACTION_LIST_GROUPS"
+  fi
+  if [ "$_select" == "3" ] || [ "$_select" == "$ACTION_GET" ]; then
+    SELECTED_ACTION="$ACTION_GET"
+  fi
+  if [ "$_select" == "4" ] || [ "$_select" == "$ACTION_ADD" ]; then
+    SELECTED_ACTION="$ACTION_ADD"
+  fi
+  if [ "$_select" == "5" ] || [ "$_select" == "$ACTION_HELP" ]; then
+    SELECTED_ACTION="$ACTION_HELP"
+  fi
+fi
+if [ "$#" -gt 0 ]; then
+  if ( [ "$1" == "$ACTION_GET" ] || [ "$1" == "$ACTION_ADD" ] || [ "$1" == "$ACTION_SET" ] || [ "$1" == "$ACTION_LIST_GROUPS" ] || [ "$1" == "$ACTION_HELP" ]); then
+    SELECTED_ACTION=$1
+  else
+    if [ "$#" -eq 1 ]; then
+      SELECTED_GROUP=$1
+    fi
+  fi
+fi
+if [ "$#" -gt 1 ]; then
+  SELECTED_GROUP=$2
+fi
+if [ "$#" -gt 2 ]; then
+  SELECTED_KEY=$3
+fi
+if [ "$#" -gt 3 ]; then
+  SELECTED_VALUE=$4
+fi
+
+###################################################
+###  ASK USER FOR MISSING, REQUIRED PARAMETERS  ###
+###################################################
+if [ -z "$SELECTED_GROUP" ] && ([ "$SELECTED_ACTION" == "$ACTION_SET" ] || [ "$SELECTED_ACTION" == "$ACTION_GET" ] || [ "$SELECTED_ACTION" == "$ACTION_ADD" ]); then
+  get_group_by_input
+fi
+if [ "$SELECTED_ACTION" == "$ACTION_ADD" ]; then
+  if [ -z "$SELECTED_KEY" ]; then
+    printf 'Enter variable name/key: '
+    read -r SELECTED_KEY
+  fi
+  
+  if [ -z "$SELECTED_VALUE" ]; then
+    printf "Enter value for $SELECTED_KEY: "
+    read -r SELECTED_VALUE
+  fi
+fi
+
+###################################################
+# if validation of parameters succeeded, call appropriate action
+###################################################
+if [ "$SELECTED_ACTION" == "$ACTION_LIST_GROUPS" ]; then
+  print_groups
+fi
+
+if [ "$SELECTED_ACTION" == "$ACTION_GET" ]; then
+  get_set_envar
+fi
+  
+if [ "$SELECTED_ACTION" == "$ACTION_SET" ]; then
+  TMP_GROUP="$SELECTED_GROUP"
+  SELECTED_GROUP="$DEFAULT_GROUP"
+  get_set_envar
+  SELECTED_GROUP="$TMP_GROUP"
+  get_set_envar
+fi
+  
+if [ "$SELECTED_ACTION" == "$ACTION_ADD" ]; then
+  add_envar
+fi
+ 
+if [ "$SELECTED_ACTION" == "$ACTION_HELP" ]; then
+  print_usage
+fi
+
