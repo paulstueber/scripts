@@ -92,8 +92,18 @@ function get_set_envar() {
         else
           # if current line is a var, either export the var (set) or only print its export command (get)
           if [ "$SELECTED_ACTION" == "$ACTION_SET" ] && [ "$line" ] && [[ "$line"  != \#* ]]; then
-            export $line
-            echo "export $line"
+            KEY=$(echo $line | sed -n -e 's/\=.*//p')
+            VALUE=$(echo $line | sed -n -e 's/^.*\=//p')
+            
+            # if other envars are linked as value (e.g. VAR_KEY=$OTHER_VAR_KEY), use their value instead (OTHER_VAR_KEY=12345)            
+            if [[ "$VALUE"  == \$* ]]; then
+              LINKED_ENV=${VALUE:1}
+              VALUE=$(echo "$LINKED_ENV[@]")
+              VALUE="${!VALUE}"
+            fi
+
+            echo "export $KEY=$VALUE"
+            export $KEY=$VALUE
           else
             if [ "$line" ] && [[ "$line"  != \#* ]]; then
               echo "$line"
